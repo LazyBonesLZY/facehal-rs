@@ -1,0 +1,24 @@
+# Build outputs
+/target/
+**/target/
+standalone-build/native/
+standalone-build/target/
+*.o
+*.a
+/android.hardware.biometrics.face-service.facehal
+/libfacehal_jni.so
+/out/
+
+# Local tooling
+.cargo/config.local.toml
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.keystore
