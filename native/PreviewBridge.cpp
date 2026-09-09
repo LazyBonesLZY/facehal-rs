@@ -111,7 +111,7 @@ bool writeBuffer(
 
 extern "C" int32_t facehal_preview_render_nv21(
         void* window, const uint8_t* frame, size_t frameSize, int32_t width, int32_t height,
-        int32_t sensorOrientation) {
+        int32_t sensorOrientation, int32_t configureWindow) {
     if (window == nullptr || frame == nullptr || width <= 0 || height <= 0 || (width & 1) != 0 ||
         (height & 1) != 0 ||
         (sensorOrientation != 0 && sensorOrientation != 90 && sensorOrientation != 180 &&
@@ -121,22 +121,21 @@ extern "C" int32_t facehal_preview_render_nv21(
     auto* nativeWindow = static_cast<ANativeWindow*>(window);
     const int32_t bufferWidth = sensorOrientation == 90 || sensorOrientation == 270 ? height : width;
     const int32_t bufferHeight = sensorOrientation == 90 || sensorOrientation == 270 ? width : height;
-    int32_t status = ANativeWindow_setBuffersGeometry(
-            nativeWindow, bufferWidth, bufferHeight, WINDOW_FORMAT_RGBA_8888);
-    if (status != 0) {
-        status = ANativeWindow_setBuffersGeometry(nativeWindow, 0, 0, WINDOW_FORMAT_RGBA_8888);
-    }
-    if (status != 0) {
-        return status < 0 ? status : kWindowError;
+    int32_t status = 0;
+    // Reconfiguring a SurfaceView buffer queue for every frame can freeze previews on
+    // older vendor graphics stacks. Configure it once, then only lock/post new buffers.
+    if (configureWindow != 0) {
+        status = ANativeWindow_setBuffersGeometry(
+                nativeWindow, bufferWidth, bufferHeight, WINDOW_FORMAT_RGBA_8888);
+        if (status != 0) {
+            status = ANativeWindow_setBuffersGeometry(nativeWindow, 0, 0, WINDOW_FORMAT_RGBA_8888);
+        }
+        if (status != 0) {
+            return status < 0 ? status : kWindowError;
+        }
     }
     ANativeWindow_Buffer buffer{};
     status = ANativeWindow_lock(nativeWindow, &buffer, nullptr);
-    if (status != 0) {
-        const int32_t resetStatus = ANativeWindow_setBuffersGeometry(nativeWindow, 0, 0, 0);
-        if (resetStatus == 0) {
-            status = ANativeWindow_lock(nativeWindow, &buffer, nullptr);
-        }
-    }
     if (status != 0) {
         return status < 0 ? status : kWindowError;
     }

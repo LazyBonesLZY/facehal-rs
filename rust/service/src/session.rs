@@ -40,6 +40,18 @@ const CAMERA_OPEN_ATTEMPTS: usize = 1;
 const CAMERA_OPEN_RETRY_DELAY: Duration = Duration::from_millis(200);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(60);
+// The proprietary backend may create a template on its first successful enrollment frame.
+// Do not report completion until several subsequent live frames authenticate that candidate.
+// MIUI's enrollment UI advances its ring by five points per callback and ignores a new
+// callback while the previous animation is still running. Twenty paced samples provide
+// the expected 0..100 visual progression instead of completing while the ring stays at 5.
+const ENROLLMENT_CONFIRMATION_SAMPLES: i32 = 4;
+// MIUI Settings uses vendor acquired code 19 to advance each of its five ring stages.
+// The candidate frame plus four live confirmation frames produce those five stages.
+const ENROLLMENT_SAMPLE_INTERVAL: Duration = Duration::from_millis(650);
+// MIUI restarts its ring animation for every acquired/help callback. Forward bad-frame
+// guidance at most once per second and never send a GOOD/help frame beside progress.
+const ENROLLMENT_ACQUIRED_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_MISMATCH_FRAMES: usize = 12;
 const CHALLENGE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAXIMUM_HAT_AGE_MILLIS: i64 = 10 * 60 * 1_000;
@@ -356,11 +368,19 @@ impl FaceSession {
                 let mut frame_count = 0usize;
                 let mut timeout_count = 0usize;
                 let mut bad_frame_count = 0usize;
-                let mut progress_started = false;
-                let mut progress_remaining = 4i32;
+                let mut progress_remaining = ENROLLMENT_CONFIRMATION_SAMPLES + 1;
                 let mut last_status = None;
+                // (enrollment id, physical template slot). Before this is set frames are sent to
+                // the vendor enrollment action. Afterwards frames use authentication so a
+                // one-frame vendor enrollment cannot be exposed to Android as complete.
+                let mut candidate: Option<(i32, usize)> = None;
+                let mut next_confirmation_at = Instant::now();
+                let mut next_acquired_at = Instant::now();
                 while Instant::now() < deadline {
                     if should_stop(&cancellation, &closed, &callback) {
+                        if let Some((candidate_id, _)) = candidate {
+                            let _ = algorithm.remove(candidate_id);
+                        }
                         return;
                     }
                     let frame = match camera.next_frame(FRAME_TIMEOUT_MS) {
@@ -368,9 +388,7 @@ impl FaceSession {
                         Err(CameraError::Timeout) => {
                             timeout_count += 1;
                             if timeout_count == 1 || timeout_count % 10 == 0 {
-                                eprintln!(
-                                    "FaceHAL enroll: camera timeout count={timeout_count}"
-                                );
+                                eprintln!("FaceHAL enroll: camera timeout count={timeout_count}");
                             }
                             continue;
                         }
@@ -383,122 +401,142 @@ impl FaceSession {
                         }
                         Err(CameraError::Unavailable) => {
                             eprintln!("FaceHAL enroll: camera became unavailable");
+                            if let Some((candidate_id, _)) = candidate {
+                                let _ = algorithm.remove(candidate_id);
+                            }
                             drop(camera);
                             drop(_guard);
-                            notify_error(
-                                &cancellation,
-                                &callback,
-                                &closed,
-                                Error::HW_UNAVAILABLE,
-                                0,
-                            );
+                            notify_error(&cancellation, &callback, &closed, Error::HW_UNAVAILABLE, 0);
                             return;
                         }
                     };
                     frame_count += 1;
-                    if !progress_started {
-                        progress_started = true;
-                        let _ = callback.onEnrollmentProgress(0, progress_remaining);
+                    preview.render(&frame, CAMERA_WIDTH, CAMERA_HEIGHT, camera.sensor_orientation());
+
+                    // Limit accepted confirmation samples. Camera preview remains continuous, but
+                    // progress cannot be completed by a burst of adjacent frames.
+                    if candidate.is_some() && Instant::now() < next_confirmation_at {
+                        continue;
                     }
-                    preview.render(
-                        &frame,
-                        CAMERA_WIDTH,
-                        CAMERA_HEIGHT,
-                        camera.sensor_orientation(),
-                    );
-                    let status =
-                        algorithm.process_nv21(&frame, CAMERA_WIDTH, CAMERA_HEIGHT, ACTION_ENROLL);
+                    let action = if candidate.is_some() {
+                        ACTION_AUTHENTICATE
+                    } else {
+                        ACTION_ENROLL
+                    };
+                    let status = algorithm.process_nv21(&frame, CAMERA_WIDTH, CAMERA_HEIGHT, action);
                     if last_status != Some(status) || frame_count == 1 || frame_count % 30 == 0 {
                         eprintln!(
-                            "FaceHAL enroll: frame={frame_count} status={status} acquired={:?}",
+                            "FaceHAL enroll: frame={frame_count} action={action} status={status} acquired={:?} remaining={progress_remaining}",
                             map_acquired(status)
                         );
                         last_status = Some(status);
                     }
                     if status < 0 {
                         eprintln!("FaceHAL enroll: algorithm fatal status={status}");
+                        if let Some((candidate_id, _)) = candidate {
+                            let _ = algorithm.remove(candidate_id);
+                        }
                         drop(camera);
                         drop(_guard);
                         notify_error(&cancellation, &callback, &closed, map_error(status), status);
                         return;
                     }
-                    if map_acquired(status) == AcquiredInfo::GOOD && progress_remaining > 1 {
-                        progress_remaining -= 1;
-                        let _ = callback.onEnrollmentProgress(0, progress_remaining);
-                    }
-                    if status == STATUS_OK || status == STATUS_ENROLL_OK {
+
+                    if candidate.is_none() && (status == STATUS_OK || status == STATUS_ENROLL_OK) {
                         let after = match algorithm.enumerate() {
-                            Ok(ids) => {
-                                eprintln!("FaceHAL enroll: completion templates={ids:?}");
-                                ids
-                            }
+                            Ok(ids) => ids,
                             Err(error) => {
-                                eprintln!("FaceHAL enroll: completion enumerate failed: {error:?}");
-                                notify_error(
-                                    &cancellation,
-                                    &callback,
-                                    &closed,
-                                    Error::UNABLE_TO_PROCESS,
-                                    0,
-                                );
+                                eprintln!("FaceHAL enroll: candidate enumerate failed: {error:?}");
+                                notify_error(&cancellation, &callback, &closed, Error::UNABLE_TO_PROCESS, 0);
                                 return;
                             }
                         };
-                        let new_id = after
-                            .iter()
-                            .copied()
-                            .find(|id| !before.contains(id))
-                            .or_else(|| {
-                                let current = algorithm.current_face_id();
-                                (current >= 1
-                                    && after.contains(&current)
-                                    && !before.contains(&current))
-                                .then_some(current)
-                            });
+                        let new_id = after.iter().copied().find(|id| !before.contains(id)).or_else(|| {
+                            let current = algorithm.current_face_id();
+                            (current >= 1 && after.contains(&current) && !before.contains(&current)).then_some(current)
+                        });
                         if let Some(enrollment_id) = new_id {
-                            eprintln!(
-                                "FaceHAL enroll: completed id={enrollment_id} frames={frame_count}"
-                            );
-                            if authenticator_id.rotate(true).is_err() {
+                            let slot = algorithm.slots().ok().and_then(|slots| {
+                                slots.iter().position(|id| *id == Some(enrollment_id))
+                            });
+                            let Some(slot) = slot else {
+                                eprintln!("FaceHAL enroll: unable to locate candidate slot id={enrollment_id}");
                                 let _ = algorithm.remove(enrollment_id);
-                                let _ = authenticator_id.rotate(false);
-                                drop(camera);
-                                drop(preview);
-                                drop(_guard);
-                                notify_error(
-                                    &cancellation,
-                                    &callback,
-                                    &closed,
-                                    Error::HW_UNAVAILABLE,
-                                    0,
-                                );
+                                notify_error(&cancellation, &callback, &closed, Error::UNABLE_TO_PROCESS, 0);
+                                return;
+                            };
+                            if algorithm.reset().is_err() || algorithm.set_active_slot(Some(slot)).is_err() {
+                                let _ = algorithm.remove(enrollment_id);
+                                notify_error(&cancellation, &callback, &closed, Error::HW_UNAVAILABLE, 0);
                                 return;
                             }
-                            if begin_terminal(&cancellation, &callback, &closed) {
-                                drop(camera);
-                                drop(preview);
-                                drop(_guard);
-                                eprintln!(
-                                    "FaceHAL enroll: camera released before completion callback"
-                                );
-                                let _ = callback.onEnrollmentProgress(enrollment_id, 0);
-                            } else {
-                                let _ = algorithm.remove(enrollment_id);
-                                let _ = authenticator_id.rotate(
-                                    algorithm
-                                        .enumerate()
-                                        .map(|ids| !ids.is_empty())
-                                        .unwrap_or(false),
-                                );
-                            }
-                            return;
+                            candidate = Some((enrollment_id, slot));
+                            progress_remaining -= 1;
+                            send_miui_enrollment_step(&callback);
+                            next_confirmation_at = Instant::now() + ENROLLMENT_SAMPLE_INTERVAL;
+                            eprintln!("FaceHAL enroll: candidate id={enrollment_id} slot={slot}; starting live confirmation");
                         }
+                        // Do not send a successful EnrollmentFrame here. Android converts it
+                        // to onEnrollmentHelp, which resets this MIUI ring animation.
+                        continue;
                     }
-                    send_enrollment_frame(&callback, status);
+
+                    if let Some((enrollment_id, slot)) = candidate {
+                        if status == STATUS_OK || status == STATUS_UNLOCK_OK {
+                            progress_remaining -= 1;
+                            // MIUI's private enrollment UI advances only on vendor acquired code
+                            // 19. Standard AIDL progress is reserved for the terminal result.
+                            send_miui_enrollment_step(&callback);
+                            eprintln!("FaceHAL enroll: confirmed id={enrollment_id} slot={slot} remaining={progress_remaining}");
+                            if progress_remaining == 0 {
+                                if authenticator_id.rotate(true).is_err() {
+                                    let _ = algorithm.remove(enrollment_id);
+                                    let _ = authenticator_id.rotate(false);
+                                    drop(camera);
+                                    drop(preview);
+                                    drop(_guard);
+                                    notify_error(&cancellation, &callback, &closed, Error::HW_UNAVAILABLE, 0);
+                                    return;
+                                }
+                                if begin_terminal(&cancellation, &callback, &closed) {
+                                    drop(camera);
+                                    drop(preview);
+                                    drop(_guard);
+                                    eprintln!("FaceHAL enroll: completed id={enrollment_id} frames={frame_count} after live confirmation");
+                                    let _ = callback.onEnrollmentProgress(enrollment_id, 0);
+                                } else {
+                                    let _ = algorithm.remove(enrollment_id);
+                                    let _ = authenticator_id.rotate(
+                                        algorithm.enumerate().map(|ids| !ids.is_empty()).unwrap_or(false),
+                                    );
+                                }
+                                return;
+                            }
+                            next_confirmation_at = Instant::now() + ENROLLMENT_SAMPLE_INTERVAL;
+                        } else {
+                            // A poor/non-matching frame does not advance enrollment. Keep the
+                            // preview and acquired callbacks active until a valid live sample or timeout.
+                            if Instant::now() >= next_acquired_at
+                                && map_acquired(status) != AcquiredInfo::GOOD
+                            {
+                                send_enrollment_frame(&callback, status);
+                                next_acquired_at = Instant::now() + ENROLLMENT_ACQUIRED_INTERVAL;
+                            }
+                            next_confirmation_at = Instant::now() + ENROLLMENT_SAMPLE_INTERVAL;
+                        }
+                    } else if Instant::now() >= next_acquired_at
+                        && map_acquired(status) != AcquiredInfo::GOOD
+                    {
+                        send_enrollment_frame(&callback, status);
+                        next_acquired_at = Instant::now() + ENROLLMENT_ACQUIRED_INTERVAL;
+                    }
                 }
                 eprintln!(
                     "FaceHAL enroll: timed out frames={frame_count} camera_timeouts={timeout_count} bad_frames={bad_frame_count} last_status={last_status:?}"
                 );
+                if let Some((candidate_id, _)) = candidate {
+                    let _ = algorithm.remove(candidate_id);
+                }
                 drop(camera);
                 drop(_guard);
                 notify_error(&cancellation, &callback, &closed, Error::TIMEOUT, 0);
@@ -1258,6 +1296,22 @@ fn send_authentication_frame(callback: &Strong<dyn ISessionCallback>, status: i3
         data: base_frame(status),
     };
     let _ = callback.onAuthenticationFrame(&frame);
+}
+
+fn send_miui_enrollment_step(callback: &Strong<dyn ISessionCallback>) {
+    // Framework exposes VENDOR code 19 to FaceManager as help id 1019. MIUI strips
+    // 1000 and uses value 19 to enter/advance its five-stage enrollment animation.
+    let frame = EnrollmentFrame {
+        cell: None,
+        stage: EnrollmentStage::HOLD_STILL_IN_CENTER,
+        data: BaseFrame {
+            acquiredInfo: AcquiredInfo::VENDOR,
+            vendorCode: 19,
+            isCancellable: true,
+            ..Default::default()
+        },
+    };
+    let _ = callback.onEnrollmentFrame(&frame);
 }
 
 fn send_enrollment_frame(callback: &Strong<dyn ISessionCallback>, status: i32) {

@@ -1,5 +1,8 @@
 use nativewindow::Surface;
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
+
+const PREVIEW_FRAME_INTERVAL: Duration = Duration::from_millis(66); // about 15 fps
 
 unsafe extern "C" {
     fn facehal_preview_render_nv21(
@@ -9,12 +12,15 @@ unsafe extern "C" {
         width: i32,
         height: i32,
         sensor_orientation: i32,
+        configure_window: i32,
     ) -> i32;
 }
 
 pub struct Preview {
     surface: Option<Surface>,
     failure_logged: bool,
+    configured: bool,
+    last_rendered_at: Option<Instant>,
 }
 
 impl Preview {
@@ -27,10 +33,20 @@ impl Preview {
         Self {
             surface,
             failure_logged: false,
+            configured: false,
+            last_rendered_at: None,
         }
     }
 
     pub fn render(&mut self, frame: &[u8], width: i32, height: i32, sensor_orientation: i32) {
+        let now = Instant::now();
+        if self.configured
+            && self
+                .last_rendered_at
+                .is_some_and(|last| now.duration_since(last) < PREVIEW_FRAME_INTERVAL)
+        {
+            return;
+        }
         let Some(surface) = self.surface.as_ref() else {
             return;
         };
@@ -47,9 +63,13 @@ impl Preview {
                 width,
                 height,
                 sensor_orientation,
+                if self.configured { 0 } else { 1 },
             )
         };
-        if status != 0 {
+        if status == 0 {
+            self.configured = true;
+            self.last_rendered_at = Some(now);
+        } else {
             self.log_failure(status);
         }
     }
